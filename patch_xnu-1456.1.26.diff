@@ -1,0 +1,642 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 61afa6bf..deecbda3 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -586,3 +586,6 @@ bsd/dev/dtrace/profile_prvd.c		optional config_dtrace
+ bsd/dev/dtrace/fasttrap.c		optional config_dtrace
+ 
+ bsd/kern/imageboot.c                  optional config_imageboot
++
++bsd/kern/sotag.c                     standard
++bsd/kern/softpac.c                   standard
+diff --git a/bsd/kern/softpac.c b/bsd/kern/softpac.c
+new file mode 100644
+index 00000000..15bcd213
+--- /dev/null
++++ b/bsd/kern/softpac.c
+@@ -0,0 +1,78 @@
++#include <sys/softpac.h>
++#include <libkern/crypto/md5.h>
++
++pac_t compute_pac(softpac_flavor_t flavor, softpac_key_t key, u_int64_t plainptr) {
++    MD5_CTX ctx;
++    u_int8_t digest[MD5_DIGEST_LENGTH];
++    pac_t pac = 0;
++    int i;
++
++    MD5Init(&ctx);
++
++    MD5Update(&ctx, &flavor, sizeof(flavor));
++    MD5Update(&ctx, &key, sizeof(key));
++    MD5Update(&ctx, &plainptr, sizeof(plainptr));
++
++    MD5Final(digest, &ctx);
++
++    for (i = 0; i < MD5_DIGEST_LENGTH / 2; i++) {
++        pac ^= digest[2*i] | (digest[2*i+1] << 8);
++    }
++
++    return pac;
++}
++
++void *strip_signature(void *ptr) {
++    return (void *)((u_int64_t)ptr & ~PAC_BITMASK);
++}
++
++pac_t get_signature(void *ptr) {
++    return ((u_int64_t)ptr & PAC_BITMASK) >> PAC_SHIFT;
++}
++
++/*
++ * canonicalize
++ * Sign extend bit 63 to fill up all the PAC bits
++ */
++void *canonicalize(void *ptr) {
++    if ((((u_int64_t)ptr) & BITMASK_63) != 0) {
++        /* Canonical kernel pointer */
++        return (void *)(((u_int64_t)ptr) | PAC_BITMASK);
++    }
++    else {
++        /* Canonical userspace pointer */
++        return (void *)(((u_int64_t)ptr) & ~PAC_BITMASK);
++    }
++}
++
++void *softpac_sign(softpac_flavor_t flavor, softpac_key_t key, void *plainptr) {
++    u_int64_t rv;
++    pac_t pac;
++
++    pac = compute_pac(flavor, key, strip_signature(plainptr));
++
++    rv=((u_int64_t)strip_signature(plainptr)) | (((u_int64_t)pac) << PAC_SHIFT);
++
++#ifdef SOFTPAC_DEBUG_KPRINTF
++    printf("softpac_sign: 0x%llX -> 0x%llX (PAC is 0x%X)\n", (u_int64_t)plainptr, (u_int64_t)rv, pac);
++    printf("\tkey is 0x%llX\n", key);
++#endif // SOFTPAC_DEBUG_KPRINTF
++
++    return (void *)rv;
++}
++
++void *softpac_auth(softpac_flavor_t flavor, softpac_key_t key, void *encptr) {
++    u_int64_t rv;
++    pac_t correct_pac, actual_pac;
++
++    correct_pac = compute_pac(flavor, key, strip_signature(encptr));
++    actual_pac = get_signature(encptr);
++
++    if (correct_pac != actual_pac) {
++        panic("softpac_auth: Incorrect PAC for 0x%llX (got 0x%X expected 0x%X)\n", canonicalize(encptr), actual_pac, correct_pac);
++    }
++
++    rv = (u_int64_t)canonicalize(encptr);
++
++    return ((void *)rv);
++}
+diff --git a/bsd/kern/sotag.c b/bsd/kern/sotag.c
+new file mode 100644
+index 00000000..d384fd87
+--- /dev/null
++++ b/bsd/kern/sotag.c
+@@ -0,0 +1,84 @@
++#include <sys/sotag.h>
++#include <sys/softpac.h>
++#include <kern/kalloc.h>
++#include <pexpert/pexpert.h>
++
++void sotag_default_dispatch(char *dst, char *src) {
++#ifdef SOFTPAC_DEBUG_KPRINTF
++    kprintf("sotag_default_dispatch called\n");
++#endif // SOFTPAC_DEBUG_KPRINTF
++    memcpy(dst, src, SOTAG_SIZE);
++}
++
++struct sotag *alloc_sotag() {
++    struct sotag *new_tag;
++    new_tag = kalloc(sizeof(*new_tag));
++
++    if (0 == new_tag) return ((struct sotag *)0);
++
++    new_tag->vtable = (struct sotag_vtable *)kalloc(SOTAG_VTABLE_ALLOC_SIZE);
++    // Yes, this will leak memory on free- GOOD.
++    // More interesting behavior for people to play with :)
++    // (we never free the new_tag->vtable).
++
++    if (0 == new_tag->vtable) {
++        kfree(new_tag, sizeof(*new_tag));
++        return ((struct sotag *)0);
++    }
++
++    new_tag->vtable->dispatch = sotag_default_dispatch;
++
++    sign_sotag(new_tag);
++
++    return new_tag;
++}
++
++void sign_sotag(struct sotag *t) {
++    if (!t) return;
++    t->vtable->dispatch = softpac_sign(
++        SOFTPAC_INST,
++        &(t->vtable->dispatch),
++        t->vtable->dispatch
++    );
++
++    t->vtable = softpac_sign(
++        SOFTPAC_DATA,
++        &(t->vtable),
++        t->vtable
++    );
++
++#ifdef SOFTPAC_DEBUG_KPRINTF
++    kprintf("FORGING THE SIGNATURE WE WANT TO FIND:\n");
++#endif // SOFTPAC_DEBUG_KPRINTF
++
++    // This was for debugging purposes, should probably have been
++    // under the SOFTPAC_DEBUG_KPRINTF macro but oh well:
++    softpac_sign(
++        SOFTPAC_DATA,
++        &(t->vtable),
++        &(t->tag[0x8])
++    );
++}
++
++void auth_sotag(struct sotag *t) {
++    if (!t) return;
++    t->vtable = softpac_auth(
++        SOFTPAC_DATA,
++        &(t->vtable),
++        t->vtable
++    );
++
++    t->vtable->dispatch = softpac_auth(
++        SOFTPAC_INST,
++        &(t->vtable->dispatch),
++        t->vtable->dispatch
++    );
++}
++
++void sotag_call_dispatch(struct sotag *t, char *dst, char *src) {
++    if (!t) return;
++
++    auth_sotag(t);
++    t->vtable->dispatch(dst, src);
++    sign_sotag(t);
++}
+diff --git a/bsd/kern/uipc_socket.c b/bsd/kern/uipc_socket.c
+index fa8ae828..c070d0e3 100644
+--- a/bsd/kern/uipc_socket.c
++++ b/bsd/kern/uipc_socket.c
+@@ -101,6 +101,8 @@
+ #include <libkern/OSAtomic.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/assert.h>
++#include <kern/kalloc.h>
++#include <sys/sotag.h>
+ 
+ #if CONFIG_MACF
+ #include <security/mac.h>
+@@ -3228,6 +3230,54 @@ sosetopt(struct socket *so, struct sockopt *sopt)
+ 			break;
+ 		}
+ 
++		case SO_SOTAG_MODE: {
++			struct sotag_control sotag_options;
++			struct sotag *new_sotag;
++
++			error = sooptcopyin(sopt, &sotag_options, sizeof(sotag_options), sizeof(sotag_options));
++			if (error) {
++				goto bad;
++			}
++
++			switch (sotag_options.cmd) {
++				case CTF_CREATE_TAG: {
++#ifdef SOFTPAC_DEBUG_KPRINTF
++					kprintf("setsockopt(SO_SOTAG_MODE, CTF_CREATE_TAG)\n");
++#endif // SOFTPAC_DEBUG_KPRINTF
++					new_sotag = alloc_sotag();
++					if (!new_sotag) goto bad;
++					so->attached_sotag = new_sotag;
++#ifdef SOFTPAC_DEBUG_KPRINTF
++					kprintf("so->attached_sotag = %p\n", so->attached_sotag);
++#endif // SOFTPAC_DEBUG_KPRINTF
++					break;
++				}
++
++				case CTF_EDIT_TAG: {
++					/* This can cause NULL ptr derefs- GOOD. */
++					/* Since SMAP/SMEP are off I think people can allocate pages at page zero */
++					/* And do weird things with that. It's better to leave this bug in just for fun. */
++#ifdef SOFTPAC_DEBUG_KPRINTF
++					kprintf("setsockopt(SO_SOTAG_MODE, CTF_EDIT_TAG)\n");
++#endif // SOFTPAC_DEBUG_KPRINTF
++					memcpy(&so->attached_sotag->tag, &sotag_options.payload.tag, sizeof(sotag_options.payload.tag));
++					break;
++				}
++
++				case CTF_REMOVE_TAG: {
++					/* This could be a double free too, even though intention here is UaF */
++					/* This also leaks memory through the vtable never being freed- GOOD. */
++#ifdef SOFTPAC_DEBUG_KPRINTF
++					kprintf("setsockopt(SO_SOTAG_MODE, CTF_REMOVE_TAG)\n");
++#endif // SOFTPAC_DEBUG_KPRINTF
++					kfree(so->attached_sotag, sizeof(*new_sotag));
++					break;
++				}
++			}
++
++			break;
++		}
++
+ 		default:
+ 			error = ENOPROTOOPT;
+ 			break;
+@@ -3517,6 +3567,16 @@ integer:
+ 			error = sooptcopyout(sopt, &sonpx, sizeof(struct so_np_extensions));
+ 			break;	
+ 		}
++
++		case SO_SOTAG_MODE: {
++			/* Read out the tag value from this socket. (default behavior of sotag_call_dispatch). */
++			/* If the dispatch method is overriden, this will do whatever the new behavior dictates. */
++			struct sotag_control sotag_options;
++			sotag_call_dispatch(so->attached_sotag, &sotag_options.payload.tag, so->attached_sotag->tag);
++			error = sooptcopyout(sopt, &sotag_options, sizeof(sotag_options));
++			break;
++		}
++
+ 		default:
+ 			error = ENOPROTOOPT;
+ 			break;
+diff --git a/bsd/netinet6/in6_pcb.c b/bsd/netinet6/in6_pcb.c
+index 6d2c98b7..8db0077d 100644
+--- a/bsd/netinet6/in6_pcb.c
++++ b/bsd/netinet6/in6_pcb.c
+@@ -539,7 +539,9 @@ in6_pcbdetach(inp)
+ 		if (inp->in6p_options)
+ 			m_freem(inp->in6p_options);
+  		ip6_freepcbopts(inp->in6p_outputopts);
++		inp->in6p_outputopts = NULL;
+  		ip6_freemoptions(inp->in6p_moptions);
++		inp->in6p_moptions = NULL;
+ 		if (inp->in6p_route.ro_rt) {
+ 			rtfree(inp->in6p_route.ro_rt);
+ 			inp->in6p_route.ro_rt = NULL;
+diff --git a/bsd/sys/Makefile b/bsd/sys/Makefile
+index 06fc9020..e05106ec 100644
+--- a/bsd/sys/Makefile
++++ b/bsd/sys/Makefile
+@@ -89,7 +89,9 @@ KERNELFILES = \
+ 	kpi_mbuf.h kpi_socket.h kpi_socketfilter.h \
+ 	ttycom.h termios.h msg.h \
+ 	wait.h \
+-	spawn.h
++	spawn.h \
++	sotag.h softpac.h
++
+ # The last line was added to export needed headers for the MAC calls
+ # whose source is outside of the xnu/bsd tree.
+ 
+diff --git a/bsd/sys/socket.h b/bsd/sys/socket.h
+index 026ec3bb..d6154fc0 100644
+--- a/bsd/sys/socket.h
++++ b/bsd/sys/socket.h
+@@ -75,6 +75,7 @@
+ #include <sys/types.h>
+ #include <sys/cdefs.h>
+ #include <machine/_param.h>
++#include <sys/sotag.h>
+ 
+ /*
+  * Definitions related to sockets: types, address families, options.
+@@ -209,6 +210,7 @@ struct iovec {
+ #define	SO_LABEL	0x1010		/* socket's MAC label */
+ #define	SO_PEERLABEL	0x1011		/* socket's peer MAC label */
+ #endif	/* (!_POSIX_C_SOURCE || _DARWIN_C_SOURCE) */
++#define SO_SOTAG_MODE ((0x1337)) /* Special socket option for UIUCTF 2023 tagged sockets (sotag's) */
+ 
+ /*
+  * Structure used for manipulating linger option.
+diff --git a/bsd/sys/socketvar.h b/bsd/sys/socketvar.h
+index 2bd0c593..8f661bb1 100644
+--- a/bsd/sys/socketvar.h
++++ b/bsd/sys/socketvar.h
+@@ -252,6 +252,7 @@ struct socket {
+ 	struct	label *so_label;	/* MAC label for socket */
+ 	struct	label *so_peerlabel;	/* cached MAC label for socket peer */
+ 	thread_t	so_background_thread;	/* thread that marked this socket background */
++	struct sotag *tagged_sotag;
+ };
+ #endif /* KERNEL_PRIVATE */
+ 
+diff --git a/bsd/sys/softpac.h b/bsd/sys/softpac.h
+new file mode 100644
+index 00000000..dd790af4
+--- /dev/null
++++ b/bsd/sys/softpac.h
+@@ -0,0 +1,39 @@
++#ifndef SOFTPAC_H
++#define SOFTPAC_H
++
++// #DEFINE SOFTPAC_DEBUG_KPRINTF
++
++#include <sys/types.h>
++
++#define PAC_SHIFT 47ULL
++#define PAC_LEN 16ULL
++
++#define BITMASK_63 (((1ULL << 63ULL)))
++
++/* The bits that are affected by PAC (62->47 inclusive) */
++/* Uppermost bit (63) is used to distinguish kernel / user addrs */
++#define PAC_BITMASK 0x7FFF800000000000ULL
++
++typedef __uint16_t pac_t;
++
++typedef __uint64_t softpac_key_t;
++typedef __uint64_t softpac_salt_t;
++
++typedef enum {
++    SOFTPAC_DATA,
++    SOFTPAC_INST,
++} softpac_flavor_t;
++
++/*
++ * softpac_sign
++ * Encrypt a pointer using a given key, salt, and flavor.
++ */
++void *softpac_sign(softpac_flavor_t flavor, softpac_key_t key, void *plainptr);
++
++/*
++ * softpac_sign
++ * Authenticate a pointer using a given key, salt, and flavor.
++ */
++void *softpac_auth(softpac_flavor_t flavor, softpac_key_t key, void *encptr);
++
++#endif // SOFTPAC_H
+diff --git a/bsd/sys/sotag.h b/bsd/sys/sotag.h
+new file mode 100644
+index 00000000..a0214353
+--- /dev/null
++++ b/bsd/sys/sotag.h
+@@ -0,0 +1,66 @@
++#ifndef SOTAG_H
++#define SOTAG_H
++
++#define SOTAG_SIZE ((0x40))
++
++#define SOTAG_VTABLE_ALLOC_SIZE ((0x100))
++
++typedef enum {
++	CTF_CREATE_TAG, /* Allocate a tag buffer to attach to this socket (so->tagged_sotag) */
++	CTF_EDIT_TAG,   /* Write to the tag (copying the tag field from the sotag struct) */
++	CTF_SHOW_TAG,   /* Read the value of the tag out to userspace via getsockopt */
++	CTF_REMOVE_TAG  /* Free socket's sotag but don't NULL it out! */
++} sotag_action;
++
++struct sotag_vtable {
++	/* void dispatch(char *dst, char *src)*/
++	/* Copies SOTAG_SIZE from src into dst. */
++	void (*dispatch)(char *, char *);
++};
++
++struct sotag {
++	char tag[SOTAG_SIZE];
++	struct sotag_vtable *vtable; /* +0x40: First controlled bytes by OOL mach message type confusion */
++};
++
++/*
++ * sotag_control
++ * The structure passed from userspace into *sockopt that is used
++ * to control a given socket's tag.
++ *
++ * Fields:
++ * - cmd: What sotag_action does the caller want to perform?
++ * - payload: The arguments to a given sotag_action.
++ */
++struct sotag_control {
++	sotag_action cmd;
++	struct sotag payload;
++};
++
++/*
++ * alloc_sotag
++ * Constructs a new valid socket tag.
++ * Returns NULL on failure, a pointer to the new tag on success.
++ */
++struct sotag *alloc_sotag();
++
++/*
++ * sotag_call_dispatch
++ * Dispatches a PAC signed goofy_ahh_tag and tries to call dispatch,
++ * panics the kernel if any pointers are incorrectly signed.
++ */
++void sotag_call_dispatch(struct sotag *t, char *dst, char *src);
++
++/*
++ * sign_sotag
++ * Encrypt the vtable and all function pointers in a socket tag.
++ */
++void sign_sotag(struct sotag *t);
++
++/*
++ * auth_sotag
++ * Decrypt the vtable and function pointers in a socket tag, panic if incorrect
++ */
++void auth_sotag(struct sotag *t);
++
++#endif // SOTAG_H
+diff --git a/config/newvers.pl b/config/newvers.pl
+index 31deccac..c3d1f473 100755
+--- a/config/newvers.pl
++++ b/config/newvers.pl
+@@ -47,7 +47,7 @@ if($ENV{'MACHINE_CONFIG'} ne "DEFAULT") {
+ }
+ my $BUILD_DATE = `date`;
+ $BUILD_DATE =~ s/[\n\t]//g;
+-my $BUILDER=`whoami`;
++my $BUILDER="sigpwny";
+ $BUILDER =~ s/[\n\t]//g;
+ $BUILD_OBJROOT =~ s|.*(xnu.*)|$1|;
+ 
+diff --git a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+index 0366b621..9e3d46da 100644
+--- a/makedefs/MakeInc.def
++++ b/makedefs/MakeInc.def
+@@ -166,7 +166,7 @@ KC++ := $(CXX)
+ #
+ 
+ CWARNFLAGS_STD = \
+-	-Wall -Wno-format-y2k -W -Wstrict-prototypes -Wmissing-prototypes \
++	-w -Wno-format-y2k -W -Wstrict-prototypes -Wmissing-prototypes \
+ 	-Wpointer-arith -Wreturn-type -Wcast-qual -Wwrite-strings -Wswitch \
+ 	-Wshadow -Wcast-align -Wchar-subscripts -Winline \
+ 	-Wnested-externs -Wredundant-decls
+@@ -174,7 +174,7 @@ CWARNFLAGS_STD = \
+ export CWARNFLAGS ?= $(CWARNFLAGS_STD)
+ 
+ CXXWARNFLAGS_STD = \
+-	-Wall -Wno-format-y2k -W \
++	-w -Wno-format-y2k -W \
+ 	-Wpointer-arith -Wreturn-type -Wcast-qual -Wwrite-strings -Wswitch \
+ 	-Wcast-align -Wchar-subscripts -Wredundant-decls
+ 
+diff --git a/osfmk/i386/user_ldt.c b/osfmk/i386/user_ldt.c
+index 6e32ba38..88bbd726 100644
+--- a/osfmk/i386/user_ldt.c
++++ b/osfmk/i386/user_ldt.c
+@@ -176,7 +176,7 @@ i386_set_ldt(
+ 	    }
+ 
+ 	    ldt_count = end_sel - begin_sel;
+-
++	    /* XXX allocation under task lock */
+ 	    new_ldt = (user_ldt_t)kalloc(sizeof(struct user_ldt) + (ldt_count * sizeof(struct real_descriptor)));
+ 	    if (new_ldt == NULL) {
+ 		task_unlock(task);
+@@ -212,6 +212,7 @@ i386_set_ldt(
+ 	     * Install new descriptors.
+ 	     */
+ 	    if (descs != 0) {
++		    /* XXX copyin under task lock */
+ 		err = copyin(descs, (char *)&new_ldt->ldt[start_sel - begin_sel],
+ 			     num_sels * sizeof(struct real_descriptor));
+ 		if (err != 0)
+@@ -226,7 +227,7 @@ i386_set_ldt(
+ 
+ 	    /*
+ 	     * Validate descriptors.
+-	     * Only allow descriptors with user priviledges.
++	     * Only allow descriptors with user privileges.
+ 	     */
+ 	    for (i = 0, dp = (struct real_descriptor *) &new_ldt->ldt[start_sel - begin_sel];
+ 		 i < num_sels;
+@@ -235,7 +236,8 @@ i386_set_ldt(
+ 		switch (dp->access & ~ACC_A) {
+ 		    case 0:
+ 		    case ACC_P:
+-			/* valid empty descriptor */
++			/* valid empty descriptor, clear Present preemptively */
++			dp->access &= (~ACC_P & 0xff);
+ 			break;
+ 		    case ACC_P | ACC_PL_U | ACC_DATA:
+ 		    case ACC_P | ACC_PL_U | ACC_DATA_W:
+@@ -245,8 +247,6 @@ i386_set_ldt(
+ 		    case ACC_P | ACC_PL_U | ACC_CODE_R:
+ 		    case ACC_P | ACC_PL_U | ACC_CODE_C:
+ 		    case ACC_P | ACC_PL_U | ACC_CODE_CR:
+-		    case ACC_P | ACC_PL_U | ACC_CALL_GATE_16:
+-		    case ACC_P | ACC_PL_U | ACC_CALL_GATE:
+ 			break;
+ 		    default:
+ 			task_unlock(task);
+@@ -389,10 +389,10 @@ user_ldt_set(
+ 	    bcopy(user_ldt->ldt, &ldtp[user_ldt->start],
+ 		  sizeof(struct real_descriptor) * (user_ldt->count));
+ 
+-	    gdt_desc_p(USER_LDT)->limit_low = (sizeof(struct real_descriptor) * (user_ldt->start + user_ldt->count)) - 1;
++	    gdt_desc_p(USER_LDT)->limit_low = (uint16_t)((sizeof(struct real_descriptor) * (user_ldt->start + user_ldt->count)) - 1);
+ 
+ 	    ml_cpu_set_ldt(USER_LDT);
+ 	} else {
+ 	    ml_cpu_set_ldt(KERNEL_LDT);
+ 	}
+-}
++}
+\ No newline at end of file
+diff --git a/osfmk/kdp/ml/x86_64/kdp_machdep.c b/osfmk/kdp/ml/x86_64/kdp_machdep.c
+index 1da2a013..5c197cf4 100644
+--- a/osfmk/kdp/ml/x86_64/kdp_machdep.c
++++ b/osfmk/kdp/ml/x86_64/kdp_machdep.c
+@@ -388,6 +388,8 @@ kdp_i386_trap(
+ )
+ {
+     unsigned int exception, subcode = 0, code;
++	printf("KDP hit a trap (0x%X), skipping\n", trapno);
++	return FALSE;
+ 
+     if (trapno != T_INT3 && trapno != T_DEBUG) {
+     	kprintf("Debugger: Unexpected kernel trap number: "
+diff --git a/osfmk/vm/vm_pageout.c b/osfmk/vm/vm_pageout.c
+index 8906e1ab..24e9c7c1 100644
+--- a/osfmk/vm/vm_pageout.c
++++ b/osfmk/vm/vm_pageout.c
+@@ -6320,7 +6320,6 @@ vm_paging_map_object(
+ 		page->pmapped = TRUE;
+ 		cache_attr = ((unsigned int) object->wimg_bits) & VM_WIMG_MASK;
+ 
+-		//assert(pmap_verify_free(page->phys_page));
+ 		PMAP_ENTER(kernel_pmap,
+ 			   *address + page_map_offset,
+ 			   page,
+@@ -6763,7 +6762,6 @@ vm_page_decrypt(
+ 	 * that page.  That code relies on "pmapped" being FALSE, so that the
+ 	 * caches get synchronized when the page is first mapped.
+ 	 */
+-	assert(pmap_verify_free(page->phys_page));
+ 	page->pmapped = FALSE;
+ 	page->wpmapped = FALSE;
+ 
+diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
+index 3a380d4d..d5d79f14 100644
+--- a/osfmk/vm/vm_resident.c
++++ b/osfmk/vm/vm_resident.c
+@@ -101,7 +101,7 @@
+ 
+ #include <sys/kdebug.h>
+ 
+-boolean_t	vm_page_free_verify = TRUE;
++boolean_t	vm_page_free_verify = FALSE;
+ 
+ int				speculative_age_index = 0;
+ int				speculative_steal_index = 0;
+@@ -1763,7 +1763,6 @@ return_page_from_cpu_list:
+ 		assert(mem->object == VM_OBJECT_NULL);
+ 		assert(!mem->laundry);
+ 		assert(!mem->free);
+-		assert(pmap_verify_free(mem->phys_page));
+ 		assert(mem->busy);
+ 		assert(!mem->encrypted);
+ 		assert(!mem->pmapped);
+@@ -1873,7 +1872,6 @@ return_page_from_cpu_list:
+ 			assert(mem->free);
+ 			mem->free = FALSE;
+ 
+-			assert(pmap_verify_free(mem->phys_page));
+ 			assert(mem->busy);
+ 			assert(!mem->free);
+ 			assert(!mem->encrypted);
+@@ -1958,7 +1956,6 @@ vm_page_release(
+ #endif
+ 	assert(!mem->private && !mem->fictitious);
+ 	if (vm_page_free_verify) {
+-		assert(pmap_verify_free(mem->phys_page));
+ 	}
+ //	dbgLog(mem->phys_page, vm_page_free_count, vm_page_wire_count, 5);	/* (TEST/DEBUG) */
+ 
+@@ -2361,7 +2358,6 @@ vm_page_free_list(
+ 			vm_page_free_prepare_object(mem, TRUE);
+ 
+ 		if (vm_page_free_verify && !mem->fictitious && !mem->private) {
+-			assert(pmap_verify_free(mem->phys_page));
+ 		}
+ 		assert(mem->busy);
+ 
+diff --git a/osfmk/x86_64/pmap.c b/osfmk/x86_64/pmap.c
+index 13c439a9..0f1481d1 100644
+--- a/osfmk/x86_64/pmap.c
++++ b/osfmk/x86_64/pmap.c
+@@ -1254,7 +1254,12 @@ pmap_verify_free(
+ 		return(FALSE);
+ 	pv_h = pai_to_pvh(pn);
+ 	result = (pv_h->pmap == PMAP_NULL);
+-	return(result);
++
++	if (!result) {
++		printf("[*] pmap_verify_free was going to return false\n");
++	}
++
++	return TRUE;
+ }
+ 
+ boolean_t
