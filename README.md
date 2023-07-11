@@ -567,6 +567,14 @@ The entire exploit consists of the following steps:
 1. Trigger the forged vtable using `getsockopt`, this will run the attacker payload living in userspace to escalate our privileges.
 1. `cat /flag`.
 
+## A JOP-Based Solution
+
+Thanks to [2much4u](https://twitter.com/2much4ux) for contributing a solution that does not involve the `ret2usr` technique shown above, instead using kernel JOP gadgets as the payload.
+
+To see 2much4u's exploit, checkout the `solve_2much4u` directory.
+
+Thanks 2much4u!
+
 # Closing Thoughts
 
 I hope you had fun with this challenge!
